@@ -9,6 +9,15 @@
 
 #include "cudaWrappers.h"
 
+/**
+ * @brief CUDA GMM
+ * 
+ * @param X the pointer to the data
+ * @param numPoints the number of data points lines
+ * @param pointDim the dimension of data point
+ * @param numComponents the number of components
+ * @param maxIterations the maximum number of iterations
+ */
 struct GMM* cudaFit(
 	const double* X, 
 	const size_t numPoints, 

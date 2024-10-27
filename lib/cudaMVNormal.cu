@@ -35,6 +35,18 @@ __device__ void devVecMinus(const size_t N, double* z, const double* x, const do
 /*
  * Solves the lower triangular system L^T x = b for x, b \in \mathbb{R}^{N}, 
  * L \in \mathbb{R}^{N \times N} and L_{i, j} = 0 for j > i.
+ * @details 
+ */
+/**
+ * @brief Solves the lower triangular system L * x = b for x using forward substitution.
+ *
+ * @param N The size of the matrix and vectors.
+ * @param L Pointer to the lower triangular matrix L stored in row-major order.
+ * @param x Pointer to the solution vector x. Can be the same as b.
+ * @param b Pointer to the right-hand side vector b.
+ *
+ * This function assumes that L is a non-singular lower triangular matrix.
+ * It performs forward substitution to solve for x in the equation L * x = b.
  */
 __device__ void devSolveLowerTri(const size_t N, const double* L, double* x, const double* b) {
 	assert(N > 0);
@@ -88,11 +100,11 @@ __device__ double devLogMVNormNormalizer(
 ) {
 	double det = 1.0;
 	for(size_t i = 0; i < pointDim; ++i) {
-		det *= sigmaL[i * pointDim + i];
+		det *= sigmaL[i * pointDim + i]; // ad
 	}
-	det *= det;
+	det *= det; // ad * ad = det(A)^2
 
-	return -0.5 * log( 2.0 * M_PI ) * pointDim - 0.5 * log(det);
+	return -0.5 * log( 2.0 * M_PI ) * pointDim - 0.5 * log(det); // equation 3
 }
 
 /*
@@ -105,11 +117,15 @@ __device__ double devLogMVNormDist(
 	double* u, double* v
 ) {
 	devVecMinus(pointDim, v, x, mu); // v <- x - mu
-	devSolveLowerTri(pointDim, sigmaL, u, v); // u <- u s.t. L u = (x - mu)
+	devSolveLowerTri(pointDim, sigmaL, u, v); // u <- u s.t. L u = (x - mu), slove u from L * u = v = x - mu
 	devSolveLowerTriT(pointDim, sigmaL, u, u); // u <- v s.t. L^T v = u
-	return devLogMVNormNormalizer(pointDim, sigmaL) - 0.5 * devVecDot(pointDim, u, v);
+	return devLogMVNormNormalizer(pointDim, sigmaL) - 0.5 * devVecDot(pointDim, u, v); // equation 3
 }
 
+/**
+ * @brief Launch number of data points threads
+ * @details update the logProb array with the log probability of each data point, eq3
+ */
 __global__ void kernLogMVNormDist(
 	const size_t numPoints, const size_t pointDim, 
 	const double* X, double* mu, double* sigmaL,
@@ -122,9 +138,11 @@ __global__ void kernLogMVNormDist(
 		return;
 	}
 
+	// redundant for 1024 dimensions
 	double u[1024];
 	double v[1024];
-
+	
+	// equation 3
 	logProb[i] = devLogMVNormDist(
 		pointDim, 
 		& X[i * pointDim], mu, sigmaL,

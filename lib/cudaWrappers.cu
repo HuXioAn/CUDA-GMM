@@ -176,7 +176,13 @@ extern "C" void gpuCalcLogGammaK(
 	free(working);
 }
 
-
+/**
+ * @param pi weights of the components, number of components
+ * @param Mu means of the components, number of components * point dimension
+ * @param Sigma covariances of the components, number of components * point dimension * point dimension
+ * @param SigmaL Cholesky decompositions of the covariances, number of components * point dimension * point dimension
+ * @param normalizers normalizers of the components, number of components
+ */
 extern "C" void gpuGmmFit(
 	const double* X,
 	const size_t numPoints, 
@@ -262,7 +268,7 @@ extern "C" void gpuGmmFit(
 		// E-Step
 		// --------------------------------------------------------------------------
 
-		// loggamma[k * numPoints + i] = p(x_i | mu_k, Sigma_k )
+		// loggamma[k * numPoints + i] = p(x_i | mu_k, Sigma_k ), it's not gamma_{n,k} yet
 		for(size_t k = 0; k < numComponents; ++k) {
 			// Fill in numPoint many probabilities
 			kernLogMVNormDist<<<grid, block, 0, streams[k]>>>(
@@ -270,7 +276,7 @@ extern "C" void gpuGmmFit(
 				device_X, 
 				& device_Mu[k * pointDim], 
 				& device_SigmaL[k * pointDim * pointDim],
-				& device_loggamma[k * numPoints]
+				& device_loggamma[k * numPoints] // updated probabilities fpr each data point
 			);
 
 			cudaEventRecord(kernelEvent[k], streams[k]);
@@ -281,17 +287,18 @@ extern "C" void gpuGmmFit(
 			cudaStreamWaitEvent(streams[numComponents-1], kernelEvent[k], 0);
 		}
 
-		// loggamma[k * numPoints + i] = p(x_i | mu_k, Sigma_k) / p(x_i)
-		// working[i] = p(x_i)
+		// loggamma[k * numPoints + i] = p(x_i | mu_k, Sigma_k) / p(x_i), equation 6
+		// working[i] = p(x_i), equation 5
+		// we get gamma_{n,k} and p(x_i) 
 		kernCalcLogLikelihoodAndGammaNK<<<grid, block, 0, streams[numComponents - 1]>>>(
 			numPoints, numComponents,
 			device_logpi, device_working, device_loggamma
 		);
 
-		// working[0] = sum_{i} p(x_i)
+		// working[0] = sum_{i} p(x_i), equation 4
 		cudaArraySum(&deviceProp, numPoints, 1, device_working, streams[numComponents - 1]);
 
-		previousLogL = *pinnedCurrentLogL;
+		previousLogL = *pinnedCurrentLogL; // value of the summed log likelihood
 		check(cudaMemcpyAsync(
 			pinnedCurrentLogL, device_working, 
 			sizeof(double), 
@@ -304,10 +311,12 @@ extern "C" void gpuGmmFit(
 			cudaStreamSynchronize(streams[k]);
 		}
 		
+		// the L is converged stop the iteration
 		if(fabs(*pinnedCurrentLogL - previousLogL) < tolerance || *pinnedCurrentLogL < previousLogL) {
 			break;
 		}
 
+		// we just got the sum of the log likelihoods from E-step, in pinnedCurrentLogL and device_working[0]
 		// --------------------------------------------------------------------------
 		// M-Step
 		// --------------------------------------------------------------------------
@@ -317,7 +326,7 @@ extern "C" void gpuGmmFit(
 			cudaLogSumExp(
 				& deviceProp, grid, block, 
 				numPoints,
-				& device_loggamma[k * numPoints], & device_logGamma[k * numPoints], 
+				& device_loggamma[k * numPoints], & device_logGamma[k * numPoints], // equation 7
 				device_workingK, 
 				streams[k]
 			);
@@ -325,7 +334,7 @@ extern "C" void gpuGmmFit(
 
 		for(size_t k = 0; k < numComponents; ++k) {
 			double* device_workingK = & device_working[k * numPoints * pointDim * pointDim];
-			// working[i * pointDim + j] = gamma_ik / Gamma K * x_j
+			// working[i * pointDim + j] = gamma_ik / Gamma K * x_j, equation 9
 			kernCalcMu<<<grid, block, 0, streams[k]>>>(
 				numPoints, pointDim,
 				device_X, 
@@ -337,7 +346,7 @@ extern "C" void gpuGmmFit(
 
 		for(size_t k = 0; k < numComponents; ++k) {
 			double* device_workingK = & device_working[k * numPoints * pointDim * pointDim];
-			// working[0 + j] = sum gamma_ik / Gamma K * x_j
+			// working[0 + j] = sum gamma_ik / Gamma K * x_j, equation 9
 			cudaArraySum(
 				&deviceProp, numPoints, pointDim, 
 				device_workingK, 
@@ -369,7 +378,7 @@ extern "C" void gpuGmmFit(
 
 		for(size_t k = 0; k < numComponents; ++k) {
 			double* device_workingK = & device_working[k * numPoints * pointDim * pointDim];
-			kernCalcSigma<<<grid, block, 0, streams[k]>>>(
+			kernCalcSigma<<<grid, block, 0, streams[k]>>>( // equation 11
 				numPoints, pointDim,
 				device_X, 
 				& device_Mu[k * pointDim],
@@ -381,8 +390,8 @@ extern "C" void gpuGmmFit(
 
 		for(size_t k = 0; k < numComponents; ++k) {
 			double* device_workingK = & device_working[k * numPoints * pointDim * pointDim];
-			// working[0 + j] = sum gamma_ik / Gamma K * [...]_j
-			cudaArraySum(
+			// working[0 + j] = sum gamma_ik / Gamma K * [...]_j , equation 11
+			cudaArraySum( 
 				&deviceProp, numPoints, pointDim * pointDim, 
 				device_workingK, 
 				streams[k]
@@ -407,14 +416,14 @@ extern "C" void gpuGmmFit(
 			cudaStreamWaitEvent(streams[numComponents-1], kernelEvent[k], 0);
 		}
 
-		// pi_k^(t+1) = pi_k Gamma_k / sum_{i}^{K} pi_i * Gamma_i
+		// pi_k^(t+1) = pi_k Gamma_k / sum_{i}^{K} pi_i * Gamma_i, equation 8
 		// Use thread sync to compute denom to avoid data race
 		kernUpdatePi<<<1, numComponents, 0, streams[numComponents - 1]>>>(
 			numPoints, numComponents,
 			device_logpi, device_logGamma
 		);
 
-		// recompute sigmaL and normalizer
+		// recompute sigmaL and normalizer, equation 3
 		kernPrepareCovariances<<<1, numComponents, 0, streams[numComponents - 1]>>>(
 			numComponents, pointDim,
 			device_Sigma, device_SigmaL,

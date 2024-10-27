@@ -8,6 +8,12 @@
 #include "cudaFolds.hu"
 #include "cudaGmm.hu"
 
+/**
+ * @brief launched for every data point,  for all components
+ * @param logpi the weights of each component
+ * @param logPx the log-likelihood of each point
+ * @param loggamma the probability of each point 
+ */
 __global__ void kernCalcLogLikelihoodAndGammaNK(
 	const size_t numPoints, const size_t numComponents,
 	const double* logpi, double* logPx, double* loggamma
@@ -23,7 +29,7 @@ __global__ void kernCalcLogLikelihoodAndGammaNK(
 		return;
 	}
 
-	double maxArg = -INFINITY;
+	double maxArg = -INFINITY; // get the max weighted probability 
 	for(size_t k = 0; k < numComponents; ++k) {
 		const double logProbK = logpi[k] + loggamma[k * numPoints + i];
 		if(logProbK > maxArg) {
@@ -31,20 +37,20 @@ __global__ void kernCalcLogLikelihoodAndGammaNK(
 		}
 	}
 
-	double sum = 0.0;
+	double sum = 0.0; // equation 5
 	for (size_t k = 0; k < numComponents; ++k) {
 		const double logProbK = logpi[k] + loggamma[k * numPoints + i];
 		sum += exp(logProbK - maxArg);
 	}
 
 	assert(sum >= 0);
-	const double logpx = maxArg + log(sum);
+	const double logpx = maxArg + log(sum); // equation 5
 
 	for(size_t k = 0; k < numComponents; ++k) {
-		loggamma[k * numPoints + i] += -logpx;
+		loggamma[k * numPoints + i] += -logpx; // equation 6, now it's gamma_{n,k}, it used to be p(x | mu_k, Sigma_k)
 	}
 
-	logPx[i] = logpx;
+	logPx[i] = logpx; // equation 5, the log-likelihood of each point
 }
 
 __host__ double cudaGmmLogLikelihoodAndGammaNK(
@@ -129,7 +135,7 @@ __host__ void cudaLogSumExp(
 	// dest <- sum exp(src - max)
 	cudaArraySum(deviceProp, numPoints, 1, device_dest, stream);
 
-	// dest <- max + log sum exp(src - max)
+	// dest <- max + log sum exp(src - max), equation 7 
 	kernBiasAndLog<<<1, 1, 0, stream>>>(
 		device_dest, device_working
 	);
@@ -189,6 +195,7 @@ __global__ void kernCalcSigma(
 	}
 }
 
+// equation 8
 __global__ void kernUpdatePi(
 	const size_t numPoints, const size_t numComponents,
 	double* logpi, double* Gamma
@@ -211,6 +218,9 @@ __global__ void kernUpdatePi(
 	logpi[comp] = A[comp] - log(sum);
 }
 
+/**
+ * @details Cholesky decomposition of the covariance matrix, determinant of the covariance matrix, and the normalizer for the Gaussian distribution.
+ */
 __global__ void kernPrepareCovariances(
 	const size_t numComponents, const size_t pointDim,
 	double* Sigma, double* SigmaL,
@@ -231,12 +241,13 @@ __global__ void kernPrepareCovariances(
 
 	// L is the resulting lower diagonal portion of A = LL^T
 	const size_t ALen = pointDim * pointDim;
-	double* A = & Sigma[comp * ALen];
-	double* L = & SigmaL[comp * ALen];
+	double* A = & Sigma[comp * ALen]; // sigma for this component
+	double* L = & SigmaL[comp * ALen]; // lower diagonal of sigma for this component
 	for(size_t i = 0; i < ALen; ++i) { 
 		L[i] = 0;
 	}
 
+	// Cholesky decomposition, Sigma -> L
 	for (size_t k = 0; k < pointDim; ++k) {
 		double sum = 0;
 		for (int s = 0; s < k; ++s) {
@@ -264,14 +275,14 @@ __global__ void kernPrepareCovariances(
 		}
 	}
 
-	double logDet = 1.0;
+	double logDet = 1.0; // determinant of L
 	for (size_t i = 0; i < pointDim; ++i) {
 		double diag = L[i * pointDim + i];
 		assert(diag > 0);
-		logDet += log(diag);
+		logDet += log(diag); // ad 
 	}
 
-	logDet *= 2.0;
+	logDet *= 2.0; // determinant of Signma, det(LL^T) = det(L)^2
 
-	normalizers[comp] = - 0.5 * (pointDim * log(2.0 * M_PI) + logDet);
+	normalizers[comp] = - 0.5 * (pointDim * log(2.0 * M_PI) + logDet); // equation 3
 }
